@@ -1,0 +1,201 @@
+
+# reminder_bot.py
+import os
+import logging
+import sqlite3
+from datetime import datetime
+import dateparser
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
+
+# --- CONFIGURAÇÃO DE LOG ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# --- BANCO DE DADOS ---
+DB_PATH = "reminders.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            text TEXT,
+            time TEXT,
+            recurrence TEXT,
+            status TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# --- AGENDADOR ---
+scheduler = BackgroundScheduler(timezone="UTC")
+scheduler.start()
+
+# --- FUNÇÕES DE BANCO ---
+def add_reminder(user_id, text, time_str, recurrence=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO reminders (user_id, text, time, recurrence, status) VALUES (?, ?, ?, ?, ?)",
+              (user_id, text, time_str, recurrence, "active"))
+    conn.commit()
+    reminder_id = c.lastrowid
+    conn.close()
+    return reminder_id
+
+def get_reminders(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, text, time, recurrence FROM reminders WHERE user_id = ? AND status = 'active'", (user_id,))
+    reminders = c.fetchall()
+    conn.close()
+    return reminders
+
+def cancel_reminder(user_id, reminder_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE reminders SET status = 'cancelled' WHERE user_id = ? AND id = ?", (user_id, reminder_id))
+    conn.commit()
+    conn.close()
+
+# --- FUNÇÃO DE NOTIFICAÇÃO ---
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job_data = context.job.data
+    user_id = job_data["user_id"]
+    text = job_data["text"]
+    await context.bot.send_message(chat_id=user_id, text=f"⏰ Reminder: {text}")
+
+# --- PARSING DE MENSAGENS ---
+def parse_message(message: str):
+    """
+    Retorna (text, datetime_obj, recurrence) ou None se não puder interpretar.
+    """
+    # Tenta detectar recorrência
+    lower_msg = message.lower()
+    recurrence = None
+
+    if "every " in lower_msg:
+        # Exemplo: "every thursday at 15:00 remind me to feed the cat"
+        try:
+            parts = lower_msg.split("every ")[1].split(" remind me to ")
+            schedule_part = parts[0].strip()
+            text_part = parts[1].strip()
+            parsed_time = dateparser.parse(schedule_part)
+            weekday_map = {
+                "monday": "0", "tuesday": "1", "wednesday": "2",
+                "thursday": "3", "friday": "4", "saturday": "5", "sunday": "6"
+            }
+            day = next((weekday_map[d] for d in weekday_map if d in schedule_part), None)
+            time_obj = dateparser.parse(schedule_part)
+            hour = time_obj.hour
+            minute = time_obj.minute
+            recurrence = f"{minute} {hour} * * {day}"
+            return text_part, None, recurrence
+        except Exception:
+            return None, None, None
+    else:
+        # Exemplo: "remind me about the concert on December 15 at 20:00"
+        parsed_time = dateparser.parse(message)
+        if parsed_time:
+            parts = message.split("remind me")
+            if len(parts) > 1:
+                text_part = parts[-1].replace("about", "").replace("to", "").strip()
+                return text_part, parsed_time, None
+    return None, None, None
+
+# --- HANDLERS DO BOT ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Hi! I can remind you about things.\nType something like:\n• 'Remind me about the concert on December 15 at 20:00'\n• 'Every Friday at 18:30 remind me to take out the trash'\n\nUse /help for more commands.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🧭 Commands:\n/list - show active reminders\n/cancel <id> - cancel a reminder\n/help - show this message")
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminders = get_reminders(update.message.from_user.id)
+    if not reminders:
+        await update.message.reply_text("📭 You have no active reminders.")
+        return
+    msg = "📋 *Your reminders:*\n"
+    for r in reminders:
+        id_, text, time_, rec = r
+        if rec:
+            msg += f"🔄 #{id_}: {text} (recurs {rec})\n"
+        else:
+            msg += f"⏰ #{id_}: {text} at {time_}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /cancel <id>")
+        return
+    try:
+        reminder_id = int(context.args[0])
+        cancel_reminder(update.message.from_user.id, reminder_id)
+        await update.message.reply_text(f"❌ Reminder #{reminder_id} cancelled.")
+    except ValueError:
+        await update.message.reply_text("Invalid ID format.")
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    msg_text = update.message.text
+    text, time_obj, recurrence = parse_message(msg_text)
+
+    if not text:
+        await update.message.reply_text("❗Sorry, I couldn't understand that. Try again.")
+        return
+
+    if recurrence:
+        # Recorrente
+        reminder_id = add_reminder(user_id, text, "recurring", recurrence)
+        scheduler.add_job(
+            send_reminder,
+            CronTrigger.from_crontab(recurrence),
+            args=[context],
+            kwargs={"data": {"user_id": user_id, "text": text}},
+            id=str(reminder_id)
+        )
+        await update.message.reply_text(f"🔄 Recurring reminder set: “{text}” ({recurrence})")
+    else:
+        # Único
+        reminder_id = add_reminder(user_id, text, str(time_obj))
+        scheduler.add_job(
+            send_reminder,
+            DateTrigger(run_date=time_obj),
+            args=[context],
+            kwargs={"data": {"user_id": user_id, "text": text}},
+            id=str(reminder_id)
+        )
+        await update.message.reply_text(f"✅ I'll remind you to “{text}” on {time_obj.strftime('%Y-%m-%d %H:%M')}.")
+
+# --- MAIN ---
+def main():
+    init_db()
+    TOKEN = "8223435491:AAFwljAVYNHpP_8lp4P7ip1AJ4_6t8fFU_c"
+    if not TOKEN:
+        print("❌ Please set TELEGRAM_BOT_TOKEN environment variable.")
+        return
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    print("✅ Bot running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
